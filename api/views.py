@@ -15,8 +15,16 @@ from .serializers import (
     QuestionSerializer, QuestionPaperSerializer, GenerateQuestionPaperSerializer
 )
 
+import os
+from dotenv import load_dotenv
+from openai import OpenAI
+
+load_dotenv()
+
 # Set up OpenAI
-openai.api_key = settings.OPENAI_API_KEY
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+
 
 class SubjectListView(generics.ListCreateAPIView):
     queryset = Subject.objects.all()
@@ -49,7 +57,7 @@ class QuestionListView(generics.ListCreateAPIView):
 @api_view(['POST'])
 def generate_question_paper(request):
     serializer = GenerateQuestionPaperSerializer(data=request.data)
-    
+    # print("Received data:", request.data) # json data from frontend
     if not serializer.is_valid():
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
     
@@ -158,7 +166,7 @@ def generate_ai_questions(subject, topics, grade, total_marks, duration):
     """
     
     try:
-        response = openai.ChatCompletion.create(
+        response = client.chat.completions.create(
             model="gpt-3.5-turbo",
             messages=[
                 {"role": "system", "content": "You are an expert teacher creating educational questions. Always return valid JSON."},
@@ -169,7 +177,8 @@ def generate_ai_questions(subject, topics, grade, total_marks, duration):
         )
         
         content = response.choices[0].message.content.strip()
-        
+        # print("AI raw response:", content) # Test AI response
+
         # Try to parse JSON from the response
         try:
             questions = json.loads(content)
