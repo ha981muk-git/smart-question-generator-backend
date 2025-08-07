@@ -9,7 +9,7 @@ from django.conf import settings
 import openai
 import json
 import random
-from .models import Subject, Grade, Topic, Question, QuestionPaper
+from .models import Subject, Grade, Topic, Question, QuestionPaper, QuestionPaperQuestion
 from .serializers import (
     SubjectSerializer, GradeSerializer, TopicSerializer, 
     QuestionSerializer, QuestionPaperSerializer, GenerateQuestionPaperSerializer
@@ -57,7 +57,7 @@ class QuestionListView(generics.ListCreateAPIView):
 @api_view(['POST'])
 def generate_question_paper(request):
     serializer = GenerateQuestionPaperSerializer(data=request.data)
-    # print("Received data:", request.data) # json data from frontend
+    print("Received data:", request.data) # json data from frontend
     if not serializer.is_valid():
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
     
@@ -82,7 +82,7 @@ def generate_question_paper(request):
             total_marks=data['total_marks'],
             duration=data['duration']
         )
-        
+
         # Create question paper
         question_paper = QuestionPaper.objects.create(
             title=f"{data['subject']} - Grade {data['grade']} Question Paper",
@@ -91,35 +91,58 @@ def generate_question_paper(request):
             total_marks=data['total_marks'],
             duration=data['duration']
         )
-        
+
         # Save generated questions
         saved_questions = []
         for i, q_data in enumerate(questions):
-            # Get or create topic
-            topic_obj, _ = Topic.objects.get_or_create(
-                name=q_data.get('topic', data['topics'][0]),
-                subject=subject_obj,
-                grade=grade_obj
-            )
-            
-            question = Question.objects.create(
-                question_text=q_data['question'],
-                question_type=q_data.get('type', 'short'),
-                difficulty=q_data.get('difficulty', 'medium'),
-                marks=q_data.get('marks', 2),
-                topic=topic_obj,
-                answer=q_data.get('answer', ''),
-                option_a=q_data.get('option_a', ''),
-                option_b=q_data.get('option_b', ''),
-                option_c=q_data.get('option_c', ''),
-                option_d=q_data.get('option_d', ''),
-                correct_option=q_data.get('correct_option', '')
-            )
-            saved_questions.append(question)
-        
-        # Add questions to paper
+            try:
+                # Get or create topic
+                topic_obj, _ = Topic.objects.get_or_create(
+                    name=q_data.get('topic', data['topics'][0]),
+                    subject=subject_obj,
+                    grade=grade_obj
+                )
+
+                if q_data.get('question_type') == 'mcq':
+                    options = q_data.get('options', {})
+                    if not options or not all(k in options for k in ['A', 'B', 'C', 'D']):
+                        print(f"Warning: MCQ question {i+1} has incomplete options, using fallback")
+                        options = {"A": "Option A", "B": "Option B", "C": "Option C", "D": "Option D"}
+                else:
+                    options = {}
+
+                question = Question.objects.create(
+                    question_text=q_data.get('question_text', f'Question {i+1}'),
+                    question_type=q_data.get('question_type', 'short'),
+                    difficulty=q_data.get('difficulty_level', 'medium'),
+                    marks=q_data.get('marks', 2),
+                    topic=topic_obj,
+                    answer=q_data.get('answer', ''),
+                    option_a=options.get('A', ''),
+                    option_b=options.get('B', ''),
+                    option_c=options.get('C', ''),
+                    option_d=options.get('D', ''),
+                    correct_option=q_data.get('correct_option', '')
+                )
+                saved_questions.append(question)
+                
+            except Exception as e:
+                print(f"Error creating question {i+1}: {e}")
+                print(f"Question data: {q_data}")
+                # Continue with next question instead of failing completely
+                continue
+
+        # Add questions to paper with proper ordering
         for i, question in enumerate(saved_questions):
-            question_paper.questions.add(question)
+            
+            # Create the relationship through the intermediate model
+            QuestionPaperQuestion.objects.create(
+                question_paper=question_paper,
+                question=question,
+                section='A',  # Default section
+                order=i + 1   # Set the order (1, 2, 3, etc.)
+            )
+        
         
         # Serialize and return
         serializer = QuestionPaperSerializer(question_paper)
@@ -140,30 +163,49 @@ def generate_ai_questions(subject, topics, grade, total_marks, duration):
     topics_str = ", ".join(topics)
     
     prompt = f"""
-    Generate {num_questions} educational questions for:
+    Generate exactly {num_questions} educational questions for:
     - Subject: {subject}
     - Grade: {grade}
     - Topics: {topics_str}
     - Total marks should be around {total_marks}
     - Duration: {duration} minutes
+
+    Include a mix of:
+    - Multiple choice questions (question_type: "mcq")
+    - Short answer questions (question_type: "short")
+    - Long answer questions (question_type: "long")
+
+    CRITICAL: Return ONLY a valid JSON array. No explanations, no markdown, no code blocks.
+
+    Each question must be a JSON object with these exact keys:
+    - "question_text": string (the actual question)
+    - "question_type": one of "mcq", "short", "long"
+    - "difficulty_level": one of "easy", "medium", "hard"
+    - "marks": integer between 1 and 5
+    - "answer": string (correct answer)
+    - "topic": string (topic name)
     
-    Create a mix of question types:
-    - Multiple choice questions (4 options each)
-    - Short answer questions
-    - Long answer questions
-    
-    For each question, provide:
-    1. Question text
-    2. Question type (mcq, short, long)
-    3. Difficulty level (easy, medium, hard)
-    4. Marks (1-5 based on complexity)
-    5. Answer
-    6. For MCQ: 4 options (A, B, C, D) and correct option
-    7. Topic it belongs to
-    
-    Return as a JSON array where each question is an object.
-    Make questions age-appropriate for grade {grade} students.
+    For MCQ questions, also include:
+    - "options": {{"A": "option1", "B": "option2", "C": "option3", "D": "option4"}}
+    - "correct_option": "A" or "B" or "C" or "D"
+
+    Example format:
+    [
+        {{
+            "question_text": "What is 2+2?",
+            "question_type": "mcq",
+            "difficulty_level": "easy",
+            "marks": 1,
+            "answer": "4",
+            "topic": "arithmetic",
+            "options": {{"A": "3", "B": "4", "C": "5", "D": "6"}},
+            "correct_option": "B"
+        }}
+    ]
+
+    Return the JSON array now:
     """
+
     
     try:
         response = client.chat.completions.create(
@@ -177,21 +219,53 @@ def generate_ai_questions(subject, topics, grade, total_marks, duration):
         )
         
         content = response.choices[0].message.content.strip()
-        # print("AI raw response:", content) # Test AI response
+        print("AI raw response:", content) # Test AI response
+
+        # Clean the content - remove markdown code blocks if present
+        if content.startswith('```json'):
+            content = content[7:]  # Remove ```json
+        if content.startswith('```'):
+            content = content[3:]   # Remove ```
+        if content.endswith('```'):
+            content = content[:-3]  # Remove trailing ```
+        
+        content = content.strip()
 
         # Try to parse JSON from the response
         try:
             questions = json.loads(content)
-        except json.JSONDecodeError:
-            # If direct parsing fails, try to extract JSON from the response
+            # Validate that it's a list
+            if not isinstance(questions, list):
+                raise ValueError("Response is not a JSON array")
+            
+            # Validate each question has required fields
+            for i, q in enumerate(questions):
+                if not isinstance(q, dict):
+                    raise ValueError(f"Question {i+1} is not a valid object")
+                
+                required_fields = ['question_text', 'question_type', 'difficulty_level', 'marks', 'answer', 'topic']
+                for field in required_fields:
+                    if field not in q:
+                        print(f"Warning: Question {i+1} missing field '{field}', using default")
+            
+            return questions
+            
+        except json.JSONDecodeError as e:
+            print(f"JSON parsing failed: {e}")
+            print(f"Problematic content: {content[:500]}...")
+            
+            # Try to extract JSON from the response using regex
             import re
             json_match = re.search(r'\[.*\]', content, re.DOTALL)
             if json_match:
-                questions = json.loads(json_match.group())
-            else:
-                raise ValueError("No valid JSON found in response")
-        
-        return questions
+                try:
+                    questions = json.loads(json_match.group())
+                    return questions
+                except json.JSONDecodeError:
+                    print("Regex extraction also failed")
+            
+            # If all parsing fails, use fallback
+            raise ValueError("No valid JSON found in response")
         
     except Exception as e:
         # Fallback: return sample questions if AI fails
@@ -207,35 +281,54 @@ def generate_fallback_questions(subject, topics, num_questions):
         
         if i % 3 == 0:  # MCQ
             questions.append({
-                "question": f"What is the main concept in {topic}?",
-                "type": "mcq",
-                "difficulty": "medium",
+                "question_text": f"What is the main concept in {topic}?",
+                "question_type": "mcq",
+                "difficulty_level": "medium",
                 "marks": 1,
                 "topic": topic,
-                "option_a": f"Basic concept of {topic}",
-                "option_b": f"Advanced theory of {topic}",
-                "option_c": f"Application of {topic}",
-                "option_d": f"History of {topic}",
+                "options": {
+                    "A": f"Basic concept of {topic}",
+                    "B": f"Advanced theory of {topic}",
+                    "C": f"Application of {topic}",
+                    "D": f"History of {topic}"
+                },
                 "correct_option": "A",
                 "answer": f"Basic concept of {topic}"
             })
         elif i % 3 == 1:  # Short answer
             questions.append({
-                "question": f"Explain the importance of {topic} in {subject}.",
-                "type": "short",
-                "difficulty": "medium",
+                "question_text": f"Explain the importance of {topic} in {subject}.",
+                "question_type": "short",
+                "difficulty_level": "medium",
                 "marks": 3,
                 "topic": topic,
                 "answer": f"{topic} is important in {subject} because it forms the foundation for understanding key concepts."
             })
         else:  # Long answer
             questions.append({
-                "question": f"Discuss the various aspects of {topic} and its applications.",
-                "type": "long",
-                "difficulty": "hard",
+                "question_text": f"Discuss the various aspects of {topic} and its applications.",
+                "question_type": "long",
+                "difficulty_level": "hard",
                 "marks": 5,
                 "topic": topic,
                 "answer": f"Detailed explanation of {topic} covering theoretical aspects, practical applications, and real-world examples."
             })
     
     return questions
+
+
+# Validate the structure of questions for later
+# This function checks if the questions follow the expected schema
+def validate_questions_schema(questions):
+    for i, q in enumerate(questions):
+        required_keys = ["question_text", "question_type", "difficulty_level", "marks", "answer", "topic"]
+        for key in required_keys:
+            if key not in q:
+                raise ValueError(f"Missing key '{key}' in question {i+1}")
+        
+        if q["question_type"] == "mcq":
+            if "options" not in q or "correct_option" not in q:
+                raise ValueError(f"MCQ question {i+1} is missing 'options' or 'correct_option'")
+            opts = q["options"]
+            if not all(k in opts for k in ['A', 'B', 'C', 'D']):
+                raise ValueError(f"MCQ options incomplete in question {i+1}")
